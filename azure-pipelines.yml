@@ -1,0 +1,161 @@
+# Docker
+# Build and push an image to Azure Container Registry
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+trigger:
+- main
+
+variables:
+  tag: '$(Build.BuildId)'
+  acrloginserver: 'amaonbooks.azurecr.io'
+  backendimagename: 'ecommerce-backend'
+  frontendimagename: 'ecommerce-frontend'
+  aksName: 'aks-cluster-dev'
+  aksRG: 'aks-rg-dev'
+
+pool:
+  vmImage: 'ubuntu-latest'
+stages:
+  - stage: BuildAndPush
+    displayName: BuildAndPushDockerImage
+    jobs:
+      - job: BuildImages
+        steps:
+          - checkout: self
+          - task: Docker@2
+            inputs:
+              containerRegistry: 'azacr_sc'
+              repository: '$(backendimagename)'
+              command: 'buildAndPush'
+              Dockerfile: 'backend/Dockerfile'
+              buildContext: 'backend'
+              tags: |
+                $(tag)
+                latest
+          - task: Docker@2
+            inputs:
+              containerRegistry: 'azacr_sc'
+              repository: '$(frontendimagename)'
+              command: 'buildAndPush'
+              Dockerfile: 'frontend/Dockerfile'
+              buildContext: 'frontend'
+              tags: |
+                $(tag)
+                latest
+  - stage: Terraform
+    dependsOn: BuildAndPush
+    jobs:
+      - job: Terraformapply
+        steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: 'latest'
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              backendServiceArm: 'Amazon-SCManual1'
+              backendAzureRmResourceGroupName: 'tf-rg'
+              backendAzureRmStorageAccountName: 'tfstorage1103'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'aks.tfstate'
+              commandOptions: "-reconfigure"
+              workingDirectory: Terraform
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              commandOptions: '--auto-approve'
+              environmentServiceNameAzureRM: 'Amazon-SCManual1'
+              workingDirectory: Terraform
+  - stage: Deploy
+    dependsOn: Terraform
+    jobs:
+      - job: DeployApp
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: Connect to AKS
+            inputs:
+              azureSubscription: 'Amazon-SCManual1'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: 'az aks get-credentials --resource-group $(aksRG) --name $(aksName) --overwrite-existing'
+          - task: AzureCLI@2
+            name: detectenv
+            displayName: find the active env
+            inputs:
+              azureSubscription: 'Amazon-SCManual1'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                CUREENT=$(kubectl get scv backend -o jsonpath='{.spec.selector.version}' 2>/dev/null || echo "none")
+                          if [ "$CURRENT" = "blue" ]; then
+                            NEXT="green"
+                          else
+                            NEXT="blue"
+                          fi
+                          echo "Cureent environment: $CURRENT"
+                          echo "Deploying environment: $NEXT"
+                          echo "##vso[task.setvariable variable=targetEnv]$NEXT"
+                          echo "##vso[task.setvariable variable=targetEnv;isOutput=true]$NEXT"
+          - task: AzureCLI@2
+            displayName: deploy mysql
+            inputs:
+              azureSubscription: 'Amazon-SCManual1'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                kubectl apply -f K8s/mysql-secrets.yaml
+                kubectl apply -f K8s/mysql-pvc.yaml
+                kubectl apply -f K8s/mysql-deployment.yaml
+                kubectl apply -f K8s/mysql-services.yaml
+                kubectl rollout status deployment/mysql
+          - task: AzureCLI@2
+            displayName: services deployment
+            inputs:
+              azureSubscription: 'Amazon-SCManual1'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                kubectl apply -f K8s/backend-services.yaml
+                kubectl apply -f K8s/frontend-services.yaml
+          - task: AzureCLI@2
+            displayName: app deployment
+            inputs:
+              azureSubscription: 'Amazon-SCManual1'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Deploying $(targetEnv)..."
+                kubectl apply -f K8s/backend-$(targetEnv).yaml
+                kubectl apply -f K8s/frontend-$(targetEnv).yaml
+                echo "Forcing pod to refresh (important for latest tag)..."
+                kubectl rollout restart deployment/backend-$(targetEnv)
+                kubectl rollout restart deployment/frontend-$(targetEnv)
+                kubectl rollout status deployment/backend-$(targetEnv)
+                kubectl rollout status deployment/frontend-$(targetEnv)
+                kubectl get pods
+  - stage: SwitchTraffic
+    dependsOn: Deploy
+    variables:
+      targetEnv: $[ stageDependencies.Deploy.DeployApp.outputs['detectEnv.targetEnv'] ]
+    jobs:
+      - deployment: Switch
+        environment: Production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: app deployment
+                  inputs:
+                    azureSubscription: 'Amazon-SCManual1'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az aks get-credentials --resource-group $(aksRG) --name $(aksName) --overwrite-existing
+                      echo "switching to $(targetEnv)..."
+                      kubectl patch svc backend -p "{\"spec\":{\selector\":{\"app\":\"backend\",\"version\":\$(targetEnv)\"}}}"
+                      kubectl patch svc frontend -p "{\"spec\":{\selector\":{\"app\":\"frontend\",\"version\":\$(targetEnv)\"}}}"
+                      kubectl get endpoints
